@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT usage monitor
 // @namespace    https://chatgpt.com/usage-monitor
-// @version      2.1.2
+// @version      2.1.3
 // @description  On the Usage page: predicts when you'll hit 0% left, alarms 24/12/6 s before (plus a % backstop), learns from every cycle, and shows what the burn is costing you.
 // @match        https://chatgpt.com/*
 // @run-at       document-idle
@@ -11,7 +11,8 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
-// @connect      claude.ai
+// @grant        GM_openInTab
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (() => {
@@ -30,7 +31,7 @@
   const RESET_PRICE = 125;        // $ for one instant usage-limit reset (what checkout showed on Oct 25, 2026)
   const CREDIT_PRICE = 0.028;     // $ per credit you pay: 0.04 list, 0.036/0.032/0.028 for $100/$200/$1,000 packs, 0.024 with auto-reload at 25k
   const ROUTE = /^\/settings\/usage/;
-  const VERSION = '2.1.2';
+  const VERSION = '2.1.3';
   const SCRIPT_URL = 'https://raw.githubusercontent.com/garitar/usage-monitor/main/chatgpt-usage-monitor.user.js';   // where the newest build lives; the monitor checks it for a newer @version
 
   const K = { hist: 'um2.history', cur: 'um2.current', calib: 'um2.calibration', log: 'um2.log', prefs: 'um2.prefs', last: 'um2.lastResult', recent: 'um2.history.recent', leader: 'um2.leader', day: 'um2.day', econ: 'um2.econ' };
@@ -528,7 +529,8 @@
   function runLearner(cycles, currentKey, done) {
     const src = `${learnerModule.toString()}\nconst L = learnerModule();\nonmessage = e => { let r = null; try { r = L.calibrate(L.makePredictor, e.data.cycles, { current: e.data.current }); } catch (err) {} postMessage(r); };`;
     let w = null, url = null;
-    try { url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' })); w = new Worker(url); } catch (e) { w = null; }
+    const WW = (typeof unsafeWindow !== 'undefined' && unsafeWindow && unsafeWindow.Worker) || (typeof Worker !== 'undefined' ? Worker : null);
+    try { url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' })); w = WW ? new WW(url) : null; } catch (e) { w = null; }
     if (!w) { setTimeout(() => { let r = null; try { r = L.calibrate(L.makePredictor, cycles.slice(-25), { current: currentKey }); } catch (e) {} done(r); }, 50); return; }
     const finish = r => { try { w.terminate(); URL.revokeObjectURL(url); } catch (e) {} done(r); };
     const to = setTimeout(() => finish(null), 120000);
@@ -543,8 +545,10 @@
   }
 
   // ---- Browser side ----
-  if (window.__usageMonitor2Stop) { try { window.__usageMonitor2Stop(); } catch (e) {} }
+  const W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;   // the page's own window (Tampermonkey sandboxes `window`)
+  if (W.__usageMonitor2Stop) { try { W.__usageMonitor2Stop(); } catch (e) {} }
   const TAB = Math.random().toString(36).slice(2);
+  const LIVE = 'um2.live', SILENCE = 'um2.silence';
   const prefs = Object.assign({ sound: true, logOpen: true }, store.get(K.prefs, {}));
   const clock = t => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
   const stamp = t => new Date(t).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
@@ -561,7 +565,7 @@
 
   // sound
   let actx = null;
-  function unlockAudio() { try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }
+  function unlockAudio() { try { actx = actx || new (W.AudioContext || W.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }
   function tone(n, freq, gap, type, vol) {
     if (!actx || !prefs.sound) return;
     const t0 = actx.currentTime + 0.02;
@@ -608,7 +612,7 @@
     if (inPip) bPop.style.display = 'none';
     head.append(dot, title, bUpd, bPop, bSound, bExport, bMin);
     title.title = `v${VERSION}`;
-    bUpd.onclick = () => { try { window.open(SCRIPT_URL, '_blank'); } catch (e) {} };
+    bUpd.onclick = () => { try { if (typeof GM_openInTab === 'function') GM_openInTab(SCRIPT_URL, { active: true }); else W.open(SCRIPT_URL, '_blank'); } catch (e) {} };
     const body = el('div');
     // hero
     const hero = el('div', 'display:flex;align-items:baseline;justify-content:space-between;gap:10px;');
@@ -660,7 +664,7 @@
     };
     bExport.onclick = () => exportHistory();
     bMin.onclick = () => { body.style.display = body.style.display === 'none' ? '' : 'none'; bMin.textContent = body.style.display === 'none' ? '+' : '–'; };
-    bSilence.onclick = () => { core.silence(); render(); };
+    bSilence.onclick = () => { core.silence(); ls.set(SILENCE, Date.now()); render(); };
     logHead.onclick = () => { prefs.logOpen = !prefs.logOpen; store.set(K.prefs, prefs); for (const p of panels) { p.logBox.style.display = prefs.logOpen ? '' : 'none'; p.logTog.textContent = prefs.logOpen ? 'hide' : 'show'; } };
     if (inPip) root.dataset.pip = '1';
     const p = { doc, root, dot, big, countdown, etaL, etaR, fill, pips, bSilence, sBurn, sCurve, sAlarms, sLast, cReset, cCredits, cToday, cValue, hint, note, logBox, logTog, bSound, bUpd };
@@ -671,16 +675,16 @@
   let pipWin = null;
   async function openPip() {
     unlockAudio();
-    if (pipWin || !window.documentPictureInPicture) return;
+    if (pipWin || !W.documentPictureInPicture) { if (!W.documentPictureInPicture) statusNote = 'this Chrome has no pop-out (document picture-in-picture) support'; return; }
     try {
-      pipWin = await window.documentPictureInPicture.requestWindow({ width: 384, height: 430 });
+      pipWin = await W.documentPictureInPicture.requestWindow({ width: 384, height: 430 });
       pipWin.document.title = 'Usage monitor';
       pipWin.document.body.style.cssText = 'margin:0;background:#0f1115;';
       const p = buildPanel(pipWin.document, true);
       pipWin.document.body.append(p.root);
       pipWin.addEventListener('pagehide', () => { const i = panels.indexOf(p); if (i >= 0) panels.splice(i, 1); pipWin = null; render(); });
       render();
-    } catch (e) { pipWin = null; }
+    } catch (e) { pipWin = null; statusNote = `pop-out refused: ${e && e.message ? e.message : e}`; render(); }
   }
 
   function exportHistory() {
@@ -707,9 +711,29 @@
     } catch (e) {}
   }
   const money = v => (v >= 100 ? `$${Math.round(v).toLocaleString()}` : `$${v.toFixed(v >= 10 ? 0 : 2)}`);
+  // the polling tab shares what it shows, so a second Usage tab (and its pop-out) mirrors it instead of saying "connecting"
+  let isLeader = true, liveCache = null, liveReadAt = 0;
+  function publishLive(S) {
+    try {
+      const snap = { t: Date.now(), S: { used: S.used, est: S.est, curKey: S.cur ? S.cur.key : null, fired: S.fired, thr: S.thr, calibN: S.calib ? S.calib.n : null, key: S.key, lastResult: S.lastResult, silenced: S.silenced, learning: S.learning, credits: S.credits, resetAt: S.resetAt, day: S.day, econ: S.econ }, fastShare, note: statusNote, upd: updateAvail, flashUntil, log: logLines.slice(0, 14) };
+      localStorage.setItem(LIVE, JSON.stringify(snap));
+    } catch (e) {}
+  }
+  function readLive() {
+    const t = Date.now();
+    if (t - liveReadAt < 400) return liveCache;
+    liveReadAt = t;
+    try { const v = JSON.parse(localStorage.getItem(LIVE) || 'null'); liveCache = v && t - v.t < 6000 ? v : null; } catch (e) { liveCache = null; }
+    return liveCache;
+  }
   function render() {
     if (!panels.length) return;
-    const S = core.state(), t = Date.now();
+    const t = Date.now();
+    const live = isLeader ? null : readLive();
+    const S = live ? Object.assign({}, live.S, { cur: live.S.curKey ? { key: live.S.curKey } : null, calib: live.S.calibN !== null ? { n: live.S.calibN } : null }) : core.state();
+    if (isLeader) publishLive(S);
+    const logL = live ? live.log : logLines, fShare = live ? live.fastShare : fastShare, note = live ? (live.note || 'mirroring the Usage tab that is polling') : statusNote, upd = live ? live.upd : updateAvail;
+    const flashT = live ? live.flashUntil || 0 : flashUntil;
     const left = S.used === null ? null : 100 - S.used;
     const atZero = S.used !== null && S.used >= 100;
     const secs = S.est && !S.est.paused && isFinite(S.est.at) ? (S.est.at - t) / 1000 : null;
@@ -730,7 +754,7 @@
     const resetT = S.resetAt ? fmtLong((S.resetAt - t) / 1000) : '…';
     const creditsT = S.credits !== null ? `${Math.round(S.credits).toLocaleString()} · ${money(S.credits * CREDIT_PRICE)}` + (S.econ.cpm ? ` · burns ${Math.round(S.econ.cpm)}/min (${money(S.econ.cpm * 60 * CREDIT_PRICE)}/h)` : '') : '…';
     const D = S.day || {};
-    const todayT = `${D.resets || 0} reset${D.resets === 1 ? '' : 's'}${D.resets ? ` (${money(D.resets * RESET_PRICE)})` : ''} · stall ${fmtDur((D.stallMs || 0) / 1000)}` + (fastShare !== null ? ` · ${Math.round(fastShare * 100)}% fast` : '');
+    const todayT = `${D.resets || 0} reset${D.resets === 1 ? '' : 's'}${D.resets ? ` (${money(D.resets * RESET_PRICE)})` : ''} · stall ${fmtDur((D.stallMs || 0) / 1000)}` + (fShare !== null && fShare !== undefined ? ` · ${Math.round(fShare * 100)}% fast` : '');
     let valueT = 'measuring…', hintT = '';
     if (S.econ.resetValueCredits) {
       const v = S.econ.resetValueCredits, usd = v * CREDIT_PRICE;
@@ -738,9 +762,9 @@
       hintT = (usd < RESET_PRICE ? `At this workload, running on credits is ${Math.round((1 - usd / RESET_PRICE) * 100)}% cheaper than a $${RESET_PRICE} reset.` : `At this workload a $${RESET_PRICE} reset buys ${(usd / RESET_PRICE).toFixed(1)}× the work your money buys on credits.`) + (S.econ.measured ? ` Measured over ${S.econ.n} run-out${S.econ.n === 1 ? '' : 's'}.` : ' Provisional until a run-out has been measured end to end.');
     } else if (S.econ.ppm && !S.econ.cpm) hintT = 'Credits-vs-reset needs one stretch of work at 0% on credits to measure the credit burn.';
     if (S.resetAt && S.resetAt - t < 2 * 3600e3 && !atZero) hintT = `The free weekly reset is only ${fmtLong((S.resetAt - t) / 1000)} away — don't pay $${RESET_PRICE} for one now.`;
-    if (fastShare !== null && fastShare > 0.5 && !hintT) hintT = `${Math.round(fastShare * 100)}% of today's burn is fast mode, which drains the allowance ~2.5× faster than standard.`;
-    const flash = t < flashUntil;
-    const key = [bigT, cdT, etaLT, etaRT, color, rateT, curveT, alarmsT, lastT, resetT, creditsT, todayT, valueT, hintT, statusNote, flash, Object.keys(S.fired).join(), S.silenced, logLines.length, logLines[0], prefs.sound, actx && actx.state, updateAvail].join('|');
+    if (fShare !== null && fShare !== undefined && fShare > 0.5 && !hintT) hintT = `${Math.round(fShare * 100)}% of today's burn is fast mode, which drains the allowance ~2.5× faster than standard.`;
+    const flash = t < flashT;
+    const key = [bigT, cdT, etaLT, etaRT, color, rateT, curveT, alarmsT, lastT, resetT, creditsT, todayT, valueT, hintT, note, flash, Object.keys(S.fired || {}).join(), S.silenced, logL.length, logL[0], prefs.sound, actx && actx.state, upd].join('|');
     if (key === lastRenderKey) return;
     lastRenderKey = key;
     for (const p of panels) {
@@ -753,14 +777,14 @@
       p.sBurn.textContent = rateT; p.sCurve.textContent = curveT; p.sAlarms.textContent = alarmsT; p.sLast.textContent = lastT;
       p.cReset.textContent = resetT; p.cCredits.textContent = creditsT; p.cToday.textContent = todayT; p.cValue.textContent = valueT;
       p.hint.textContent = hintT; p.hint.style.display = hintT ? '' : 'none';
-      p.note.textContent = statusNote; p.note.style.display = statusNote ? '' : 'none';
+      p.note.textContent = note; p.note.style.display = note ? '' : 'none';
       p.bSound.textContent = prefs.sound ? (actx && actx.state === 'running' ? 'Sound on' : 'Enable sound') : 'Sound off';
-      p.bUpd.style.display = updateAvail ? '' : 'none'; p.bUpd.textContent = updateAvail ? `Update to ${updateAvail}` : 'Update';
-      p.dot.style.background = statusNote ? '#e0a231' : '#3fb950';
+      p.bUpd.style.display = upd ? '' : 'none'; p.bUpd.textContent = upd ? `Update to ${upd}` : 'Update';
+      p.dot.style.background = live ? '#8b93a1' : statusNote ? '#e0a231' : '#3fb950';
       p.root.style.borderColor = flash ? '#e5484d' : '#262a33';
       p.root.style.boxShadow = flash ? '0 0 0 3px rgba(229,72,77,.35), 0 12px 40px rgba(0,0,0,.55)' : (p.root.dataset.pip ? 'none' : '0 12px 40px rgba(0,0,0,.55)');
-      if (p.logBox.dataset.n !== String(logLines.length) || p.logBox.dataset.top !== logLines[0]) {
-        p.logBox.textContent = logLines.slice(0, 14).join('\n'); p.logBox.dataset.n = String(logLines.length); p.logBox.dataset.top = logLines[0] || '';
+      if (p.logBox.dataset.n !== String(logL.length) || p.logBox.dataset.top !== logL[0]) {
+        p.logBox.textContent = logL.slice(0, 14).join('\n'); p.logBox.dataset.n = String(logL.length); p.logBox.dataset.top = logL[0] || '';
       }
     }
   }
@@ -842,12 +866,15 @@
     const t = Date.now();
     const here = ROUTE.test(location.pathname);
     if (!here) { if (mounted) unmount(); return; }
-    if (!amLeader(t)) { if (!mounted) mount(); statusNote = 'running in another ChatGPT tab'; render(); return; }
+    isLeader = amLeader(t);
     if (!mounted) mount();
+    if (!isLeader) { render(); return; }
     if (!inFlight && t >= nextPoll) poll(t);
     core.tick(t);
+    if (t - silenceCheckedAt > 1000) { silenceCheckedAt = t; const sl = ls.get(SILENCE, 0); if (sl && sl > silenceSeen) { silenceSeen = sl; core.silence(); } }
     render();
   }
+  let silenceCheckedAt = 0, silenceSeen = Date.now();
   function onFirstClick(e) {
     unlockAudio();
     if (AUTO_POPOUT && !pipWin && ROUTE.test(location.pathname) && !(mounted && mounted.root.contains(e.target))) openPip();
@@ -867,7 +894,7 @@
   function startClock() {
     try {
       const url = URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 250);'], { type: 'text/javascript' }));
-      const w = new Worker(url);
+      const w = new W.Worker(url);
       w.onmessage = onClock;
       return () => { w.terminate(); URL.revokeObjectURL(url); };
     } catch (e) {
@@ -877,6 +904,6 @@
   }
   stopClock = startClock();
   running = true;
-  window.__usageMonitor2Stop = () => { running = false; if (stopClock) stopClock(); unmount(); };
-  window.__usageMonitor2 = { core, exportHistory, openPip };
+  W.__usageMonitor2Stop = () => { running = false; if (stopClock) stopClock(); unmount(); };
+  W.__usageMonitor2 = { version: VERSION, exportHistory, openPip, state: () => core.state() };
 })();
