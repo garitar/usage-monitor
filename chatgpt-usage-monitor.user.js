@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT usage monitor
 // @namespace    https://chatgpt.com/usage-monitor
-// @version      2.1.3
+// @version      2.1.4
 // @description  On the Usage page: predicts when you'll hit 0% left, alarms 24/12/6 s before (plus a % backstop), learns from every cycle, and shows what the burn is costing you.
 // @match        https://chatgpt.com/*
 // @run-at       document-idle
@@ -31,10 +31,10 @@
   const RESET_PRICE = 125;        // $ for one instant usage-limit reset (what checkout showed on Oct 25, 2026)
   const CREDIT_PRICE = 0.028;     // $ per credit you pay: 0.04 list, 0.036/0.032/0.028 for $100/$200/$1,000 packs, 0.024 with auto-reload at 25k
   const ROUTE = /^\/settings\/usage/;
-  const VERSION = '2.1.3';
+  const VERSION = '2.1.4';
   const SCRIPT_URL = 'https://raw.githubusercontent.com/garitar/usage-monitor/main/chatgpt-usage-monitor.user.js';   // where the newest build lives; the monitor checks it for a newer @version
 
-  const K = { hist: 'um2.history', cur: 'um2.current', calib: 'um2.calibration', log: 'um2.log', prefs: 'um2.prefs', last: 'um2.lastResult', recent: 'um2.history.recent', leader: 'um2.leader', day: 'um2.day', econ: 'um2.econ' };
+  const K = { hist: 'um2.history', cur: 'um2.current', calib: 'um2.calibration', log: 'um2.log', prefs: 'um2.prefs', last: 'um2.lastResult', recent: 'um2.history.recent', leader: 'um2.leader', day: 'um2.day', econ: 'um2.econ', rate: 'um2.lastRate', mig: 'um2.migratedFromPage' };
   const OLD_LOG = '__usagelog';
 
   // ---- Predictor + learner (same code runs in a background worker for learning) ----
@@ -325,6 +325,26 @@
     set(k, v) { try { GM_setValue(k, v); } catch (e) {} },
   } : ls;
 
+  // one-time carry-over: runs from before the Tampermonkey install kept their measurements in the page's own
+  // storage, which Tampermonkey storage doesn't see (only the history had a fallback), so the credit ratio and
+  // alarm tuning started from zero again
+  if (hasGM && !store.get(K.mig, false)) {
+    try {
+      const old = ls.get(K.econ, null);
+      if (old && (old.cpm || old.ppm)) {
+        const merged = Object.assign({}, store.get(K.econ, {}) || {});
+        for (const f of ['cpm', 'ppm', 'live']) if (!merged[f] && old[f]) merged[f] = old[f];
+        if (!merged.n) merged.n = old.n || (merged.ppm ? 1 : 0);
+        merged.at = Math.max(merged.at || 0, old.at || 0);
+        store.set(K.econ, merged);
+      }
+      for (const k of [K.calib, K.last]) { const v = ls.get(k, null); if (v && store.get(k, null) == null) store.set(k, v); }
+      const oldH = ls.get(K.hist, null);
+      if (!Array.isArray(store.get(K.hist, null)) && Array.isArray(oldH) && oldH.length) store.set(K.hist, oldH);
+    } catch (e) {}
+    store.set(K.mig, true);
+  }
+
   const dayKey = t => { const d = new Date(t); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
 
   // ---- Core: cycles, alarms, scoring, learning, economics (no DOM in here) ----
@@ -338,6 +358,11 @@
     let econ = Object.assign({ cpm: null, ppm: null, live: null, n: 0, at: 0 }, store.get(K.econ, {}));   // cpm: credits/min at 0%; ppm: %/min just before 0%
     let lastUsed = null, lastPollT = null, pred = null, est = null, fired = {}, silenced = false, learning = false;
     let credits = null, resetAt = null, creditTrail = [];
+    let lastRate = store.get(K.rate, null), rateSavedAt = 0;               // last burn seen while burning: { pm: %/min, at }
+    for (let i = history.length - 1; i >= 0 && !lastRate; i--) {           // first run: take it from the latest burst on record
+      const ev = history[i].ev || [];
+      if (ev.length >= 6) { const a = ev[Math.max(0, ev.length - 21)], b = ev[ev.length - 1]; if (b[0] > a[0] && b[2] > a[2]) lastRate = { pm: (b[2] - a[2]) / ((b[0] - a[0]) / 60000), at: history[i].s + b[0] }; }
+    }
     let thr = L.thresholdsFrom(calib, MARKS);
     const keyNow = () => (calib && L.CANDIDATES[calib.key] ? calib.key : L.DEFAULT_KEY);
     const lastU = c => (c.ev.length ? c.ev[c.ev.length - 1][2] : c.u0);
@@ -452,7 +477,8 @@
         if (extra.resetAt) resetAt = extra.resetAt;
         if (lastUsed === null) {                                           // first reading since the page loaded
           today(t);
-          const fresh = cur && !cur.end && t - (cur.lp || cur.s) < 5 * 60e3 && used >= lastU(cur);
+          const gap = cur ? t - (cur.lp || cur.s) : Infinity;
+          const fresh = cur && !cur.end && used >= lastU(cur) && (gap < 5 * 60e3 || (used === lastU(cur) && used < 100 && gap < 30 * 60e3));
           if (fresh) { const u = resume(cur); lastUsed = u; lastPollT = cur.lp || null; env.log(`(monitor started, picked up the cycle in progress at ${100 - used}% left)`); }
           else {
             if (cur && !cur.end && cur.ev.length) { const lp = cur.lp || cur.s; closeCycle(lp, 'cut', lastU(cur)); }
@@ -483,6 +509,7 @@
       },
       tick(t) {
         est = cur && pred ? pred.estimate(t) : null;
+        if (est && est.rate > 0 && !est.paused) { lastRate = { pm: est.rate * 60, at: t }; if (t - rateSavedAt > 10000) { store.set(K.rate, lastRate); rateSavedAt = t; } }
         if (!cur || lastUsed === null) return;
         if (est && est.rate) notePlanRate(t, est.rate * 60);
         const left = 100 - lastUsed;
@@ -509,7 +536,8 @@
         const D = today(env.now());
         const ppm = econ.ppm || econ.live;
         const creditsPerPct = econ.cpm && ppm ? econ.cpm / ppm : null;
-        return { used: lastUsed, est, cur, fired, thr, calib, key: keyNow(), lastResult, silenced, learning, cycles: history.length, credits, resetAt, day: D, econ: { cpm: econ.cpm, ppm, measured: !!econ.ppm, n: econ.n || 0, creditsPerPct, resetValueCredits: creditsPerPct ? 100 * creditsPerPct : null } };
+        const avg = cur && !cur.end && lastUsed !== null && lastUsed < 100 ? { pct: lastUsed - cur.u0, secs: (env.now() - cur.s) / 1000 } : null;
+        return { used: lastUsed, est, cur, fired, thr, calib, key: keyNow(), lastResult, silenced, learning, cycles: history.length, credits, resetAt, day: D, lastRate, avg, econ: { cpm: econ.cpm, ppm, measured: !!econ.ppm, n: econ.n || 0, creditsPerPct, resetValueCredits: creditsPerPct ? 100 * creditsPerPct : null } };
       },
       exportData() {
         return { app: 'chatgpt-usage-monitor', version: VERSION, exportedAt: new Date(env.now()).toISOString(), storage: hasGM ? 'tampermonkey' : 'page', marks: MARKS, prices: { reset: RESET_PRICE, credit: CREDIT_PRICE }, calibration: calib, lastResult, day, econ, current: cur, history, seed: seedCycles, log: store.get(K.log, []) };
@@ -715,7 +743,7 @@
   let isLeader = true, liveCache = null, liveReadAt = 0;
   function publishLive(S) {
     try {
-      const snap = { t: Date.now(), S: { used: S.used, est: S.est, curKey: S.cur ? S.cur.key : null, fired: S.fired, thr: S.thr, calibN: S.calib ? S.calib.n : null, key: S.key, lastResult: S.lastResult, silenced: S.silenced, learning: S.learning, credits: S.credits, resetAt: S.resetAt, day: S.day, econ: S.econ }, fastShare, note: statusNote, upd: updateAvail, flashUntil, log: logLines.slice(0, 14) };
+      const snap = { t: Date.now(), S: { used: S.used, est: S.est, curKey: S.cur ? S.cur.key : null, fired: S.fired, thr: S.thr, calibN: S.calib ? S.calib.n : null, key: S.key, lastResult: S.lastResult, silenced: S.silenced, learning: S.learning, credits: S.credits, resetAt: S.resetAt, day: S.day, econ: S.econ, lastRate: S.lastRate, avg: S.avg }, fastShare, note: statusNote, upd: updateAvail, flashUntil, log: logLines.slice(0, 14) };
       localStorage.setItem(LIVE, JSON.stringify(snap));
     } catch (e) {}
   }
@@ -740,22 +768,24 @@
     const bigT = left === null ? '…' : `${left}%`;
     let cdT = '', etaLT = '', etaRT = '';
     if (atZero) { etaLT = 'at 0% — waiting for a reset'; etaRT = S.day && S.day.zeroAt ? `stalled ${fmtDur((t - S.day.zeroAt) / 1000)}` : ''; }
-    else if (!S.est) { etaLT = left === null ? 'connecting…' : 'learning the burn rate…'; }
+    else if (!S.est) { etaLT = left === null ? 'connecting…' : S.avg && S.avg.secs >= 60 ? `slow: ${S.avg.pct ? `${S.avg.pct}% used` : 'no change'} in ${fmtDur(S.avg.secs)}` : 'waiting for the next 1% step…'; }
     else if (S.est.paused) { etaLT = 'burn paused'; etaRT = `~${fmtDur(S.est.burnLeft || 0)} of burn left`; }
     else { cdT = fmtDur(secs); etaLT = `runs out ~${clock(S.est.at)}`; etaRT = 'left'; }
     const urgent = secs !== null && secs <= MARKS[0], warn = secs !== null && secs <= HEADS_UP_S;
     const color = atZero ? '#e5484d' : left === null ? '#2b303a' : urgent ? '#e5484d' : (left <= 15 || warn) ? '#e0a231' : '#3fb950';
-    const rateT = S.est && S.est.rate ? `${(S.est.rate * 60).toFixed(1)}%/min` : atZero ? '—' : 'measuring…';
+    const pctMin = v => `${v >= 1 ? v.toFixed(1) : v.toFixed(2)}%/min`;
+    const rateT = atZero ? '—' : S.est && S.est.rate > 0 ? pctMin(S.est.rate * 60)
+      : S.lastRate ? `${S.est && S.est.paused ? 'paused' : 'idle'} · last ${pctMin(S.lastRate.pm)}` : S.est && S.est.paused ? 'paused' : 'waiting…';
     const curveT = (L.LABEL[S.cur ? S.cur.key : S.key] || S.key) + (S.est && S.est.curved ? ' · bending' : '');
     const alarmsT = `${MARKS.map(m => S.thr[m].toFixed(1)).join(' / ')} s` + (S.calib ? ` · ${S.calib.n} cycles${S.learning ? ' ⟳' : ''}` : '');
     const lr = S.lastResult;
     const lastT = lr ? lr.res.map(r => `${r.m}s ${describeErr(r.err)}`).join(' · ') : 'none scored yet';
     // cost
     const resetT = S.resetAt ? fmtLong((S.resetAt - t) / 1000) : '…';
-    const creditsT = S.credits !== null ? `${Math.round(S.credits).toLocaleString()} · ${money(S.credits * CREDIT_PRICE)}` + (S.econ.cpm ? ` · burns ${Math.round(S.econ.cpm)}/min (${money(S.econ.cpm * 60 * CREDIT_PRICE)}/h)` : '') : '…';
+    const creditsT = S.credits !== null ? `${Math.round(S.credits).toLocaleString()} · ${money(S.credits * CREDIT_PRICE)}` + (S.econ.cpm && atZero ? ` · burns ${Math.round(S.econ.cpm)}/min (${money(S.econ.cpm * 60 * CREDIT_PRICE)}/h)` : '') : '…';
     const D = S.day || {};
     const todayT = `${D.resets || 0} reset${D.resets === 1 ? '' : 's'}${D.resets ? ` (${money(D.resets * RESET_PRICE)})` : ''} · stall ${fmtDur((D.stallMs || 0) / 1000)}` + (fShare !== null && fShare !== undefined ? ` · ${Math.round(fShare * 100)}% fast` : '');
-    let valueT = 'measuring…', hintT = '';
+    let valueT = S.econ.cpm ? 'waiting for a burn to compare' : 'needs a minute at 0% on credits', hintT = '';
     if (S.econ.resetValueCredits) {
       const v = S.econ.resetValueCredits, usd = v * CREDIT_PRICE;
       valueT = `100% ≈ ${Math.round(v).toLocaleString()} credits ≈ ${money(usd)}${S.econ.measured ? '' : ' (provisional)'}`;
