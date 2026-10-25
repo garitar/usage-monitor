@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT usage monitor
 // @namespace    https://chatgpt.com/usage-monitor
-// @version      2.1.4
+// @version      2.1.5
 // @description  On the Usage page: predicts when you'll hit 0% left, alarms 24/12/6 s before (plus a % backstop), learns from every cycle, and shows what the burn is costing you.
 // @match        https://chatgpt.com/*
 // @run-at       document-idle
@@ -31,7 +31,7 @@
   const RESET_PRICE = 125;        // $ for one instant usage-limit reset (what checkout showed on Oct 25, 2026)
   const CREDIT_PRICE = 0.028;     // $ per credit you pay: 0.04 list, 0.036/0.032/0.028 for $100/$200/$1,000 packs, 0.024 with auto-reload at 25k
   const ROUTE = /^\/settings\/usage/;
-  const VERSION = '2.1.4';
+  const VERSION = '2.1.5';
   const SCRIPT_URL = 'https://raw.githubusercontent.com/garitar/usage-monitor/main/chatgpt-usage-monitor.user.js';   // where the newest build lives; the monitor checks it for a newer @version
 
   const K = { hist: 'um2.history', cur: 'um2.current', calib: 'um2.calibration', log: 'um2.log', prefs: 'um2.prefs', last: 'um2.lastResult', recent: 'um2.history.recent', leader: 'um2.leader', day: 'um2.day', econ: 'um2.econ', rate: 'um2.lastRate', mig: 'um2.migratedFromPage' };
@@ -711,6 +711,7 @@
       const p = buildPanel(pipWin.document, true);
       pipWin.document.body.append(p.root);
       pipWin.addEventListener('pagehide', () => { const i = panels.indexOf(p); if (i >= 0) panels.splice(i, 1); pipWin = null; render(); });
+      lastRenderKey = '';                                                  // a new panel starts empty: draw it now, not at the next change
       render();
     } catch (e) { pipWin = null; statusNote = `pop-out refused: ${e && e.message ? e.message : e}`; render(); }
   }
@@ -913,6 +914,7 @@
     mounted = buildPanel(document, false);
     document.body.append(mounted.root);
     document.addEventListener('pointerdown', onFirstClick, true);
+    lastRenderKey = '';
     render();
   }
   function unmount() {
